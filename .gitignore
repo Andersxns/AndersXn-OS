@@ -15,3 +15,7 @@ __pycache__/
 # repository is better off never seeing a 1.8GB file at all. Release binaries
 # belong in GitHub Releases, not in git history.
 *.xz
+
+# The download page is no longer tracked here. It stays on disk so it can be
+# deployed elsewhere, but git should not pick it back up on the next `git add -A`.
+site/
