@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+#
+# ax-provision - deploy or re-run AndersXn OS provisioning modules on a live
+# system. The same modules AX-Installer runs at install time.
+#
+#   ax-provision --list              show modules and their status
+#   ax-provision docker portainer    provision these modules
+#   ax-provision --only jellyfin     re-run one module, even if already done
+#   ax-provision --all               provision everything not yet done
+
+set -euo pipefail
+
+AXOS_LIB=/usr/lib/andersxn
+AXOS_MODULE_DIR="$AXOS_LIB/modules"
+AXOS_STATE_DIR=/etc/andersxn/provision.d
+export AXOS_MODULE_DIR
+
+# shellcheck source=/dev/null
+source "$AXOS_MODULE_DIR/_lib.sh"
+
+usage() {
+    cat <<'USAGE'
+Usage: ax-provision [options] [module...]
+
+Options:
+  --list          List available modules and whether they are provisioned
+  --all           Provision every module not already done
+  --only ID       Re-run one module even if it is marked done
+  -h, --help      Show this help
+
+Modules are shell scripts in /usr/lib/andersxn/modules named NN-<id>.sh.
+USAGE
+}
+
+module_ids() {
+    find "$AXOS_MODULE_DIR" -maxdepth 1 -name '[0-9][0-9]-*.sh' -printf '%f\n' |
+        sort | sed -e 's/^[0-9][0-9]-//' -e 's/\.sh$//'
+}
+
+do_list() {
+    printf '%-14s %s\n' MODULE STATUS
+    for id in $(module_ids); do
+        if [[ -e "$AXOS_STATE_DIR/$id.done" ]]; then
+            printf '%-14s %sprovisioned%s  %s\n' "$id" \
+                $'\033[38;2;99;214;138m' $'\033[0m' \
+                "$(cat "$AXOS_STATE_DIR/$id.done")"
+        else
+            printf '%-14s %savailable%s\n' "$id" \
+                $'\033[38;2;107;122;144m' $'\033[0m'
+        fi
+    done
+}
+
+[[ ${EUID:-$(id -u)} -eq 0 ]] || { echo "ax-provision must run as root" >&2; exit 1; }
+
+selected=()
+force_only=""
+
+while (( $# )); do
+    case "$1" in
+        --list)    do_list; exit 0 ;;
+        --all)     mapfile -t selected < <(module_ids); shift ;;
+        --only)    force_only="$2"; selected=("$2"); shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        -*)        echo "unknown option: $1" >&2; usage >&2; exit 1 ;;
+        *)         selected+=("$1"); shift ;;
+    esac
+done
+
+if (( ${#selected[@]} == 0 )); then
+    usage >&2
+    exit 1
+fi
+
+if [[ -n "$force_only" ]]; then
+    rm -f "$AXOS_STATE_DIR/$force_only.done"
+fi
+
+# Reuse the installer's own driver so behaviour is identical in both paths.
+AXOS_MODULES="${selected[*]}" \
+AXOS_USER="${SUDO_USER:-${AXOS_USER:-}}" \
+    exec "$AXOS_LIB/postinstall.sh"

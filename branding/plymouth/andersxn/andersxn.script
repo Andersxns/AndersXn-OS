@@ -1,0 +1,160 @@
+# AndersXn OS - Plymouth boot splash.
+#
+# Draws the AndersXn mark centred on the ink backdrop with a thin accent
+# progress bar beneath it, and handles the LUKS passphrase prompt for encrypted
+# installs. Assets are produced from branding/assets/AXnobg.png by
+# build/stages/30-branding.sh:
+#
+#   logo.png      512px mark
+#   bar-bg.png    1x3  progress trough
+#   bar-fg.png    1x3  progress fill (accent)
+#
+# Palette (must track build/lib/common.sh):
+#   ink    #0B0E14   snow #F2F5FA   accent #4FC3F7   muted #6B7A90
+
+# ---------------------------------------------------------------------------
+# Backdrop
+# ---------------------------------------------------------------------------
+Window.SetBackgroundTopColor(0.043, 0.055, 0.078);     # #0B0E14
+Window.SetBackgroundBottomColor(0.075, 0.090, 0.133);  # #131722
+
+screen_width  = Window.GetWidth();
+screen_height = Window.GetHeight();
+
+# ---------------------------------------------------------------------------
+# Logo
+# ---------------------------------------------------------------------------
+logo.image  = Image("logo.png");
+
+# Scale the mark to a fixed fraction of the shorter screen edge so it looks
+# identical on a 1024x768 server KVM and a 4K desktop panel.
+short_edge = screen_width;
+if (screen_height < short_edge)
+    short_edge = screen_height;
+
+logo_target = short_edge * 0.28;
+logo_scale  = logo_target / logo.image.GetWidth();
+logo.image  = logo.image.Scale(logo.image.GetWidth() * logo_scale,
+                               logo.image.GetHeight() * logo_scale);
+
+logo.sprite = Sprite(logo.image);
+logo.x = (screen_width  - logo.image.GetWidth())  / 2;
+logo.y = (screen_height - logo.image.GetHeight()) / 2 - short_edge * 0.06;
+logo.sprite.SetPosition(logo.x, logo.y, 1);
+
+# ---------------------------------------------------------------------------
+# Progress bar
+# ---------------------------------------------------------------------------
+bar.original_bg = Image("bar-bg.png");
+bar.original_fg = Image("bar-fg.png");
+
+bar.width  = short_edge * 0.28;
+bar.height = 3;
+bar.x = (screen_width - bar.width) / 2;
+bar.y = logo.y + logo.image.GetHeight() + short_edge * 0.08;
+
+bar.bg_sprite = Sprite(bar.original_bg.Scale(bar.width, bar.height));
+bar.bg_sprite.SetPosition(bar.x, bar.y, 1);
+
+bar.fg_sprite = Sprite();
+bar.fg_sprite.SetPosition(bar.x, bar.y, 2);
+
+progress = 0;
+
+fun refresh_bar(fraction) {
+    if (fraction < 0.005) fraction = 0.005;
+    if (fraction > 1)     fraction = 1;
+    bar.fg_sprite.SetImage(bar.original_fg.Scale(bar.width * fraction, bar.height));
+}
+
+# Plymouth reports boot progress as a 0..1 fraction. Ease it so the bar never
+# jumps backwards when a later estimate turns out to be more pessimistic.
+fun on_boot_progress(duration, fraction) {
+    if (fraction > progress)
+        progress = fraction;
+    refresh_bar(progress);
+}
+Plymouth.SetBootProgressFunction(on_boot_progress);
+
+# ---------------------------------------------------------------------------
+# Status messages
+# ---------------------------------------------------------------------------
+message.sprite = Sprite();
+message.y = bar.y + short_edge * 0.05;
+
+fun show_message(text) {
+    message.image = Image.Text(text, 0.42, 0.478, 0.565);   # muted #6B7A90
+    message.sprite.SetImage(message.image);
+    message.sprite.SetPosition((screen_width - message.image.GetWidth()) / 2,
+                               message.y, 5);
+}
+
+fun on_message(text) {
+    show_message(text);
+}
+Plymouth.SetMessageFunction(on_message);
+
+fun on_update(status) {
+    # Kept quiet by design: systemd unit chatter belongs in the journal, not on
+    # a splash screen. Only the progress bar reflects it.
+}
+Plymouth.SetUpdateStatusFunction(on_update);
+
+# ---------------------------------------------------------------------------
+# Password prompt (LUKS / full-disk encryption)
+# ---------------------------------------------------------------------------
+prompt.sprite = Sprite();
+bullets = [];
+
+fun clear_bullets() {
+    for (i = 0; i < bullets; i++)
+        bullets[i] = NULL;
+    bullets = [];
+}
+
+fun on_display_password(prompt_text, bullet_count) {
+    logo.sprite.SetOpacity(1);
+
+    prompt.image = Image.Text(prompt_text, 0.949, 0.960, 0.980);   # snow
+    prompt.sprite.SetImage(prompt.image);
+    prompt.sprite.SetPosition((screen_width - prompt.image.GetWidth()) / 2,
+                              bar.y, 5);
+
+    clear_bullets();
+    bullet.image = Image.Text("*", 0.310, 0.765, 0.969);           # accent
+    spacing = bullet.image.GetWidth() + 4;
+    start_x = (screen_width - (bullet_count * spacing)) / 2;
+
+    for (i = 0; i < bullet_count; i++) {
+        bullets[i] = Sprite(bullet.image);
+        bullets[i].SetPosition(start_x + i * spacing,
+                               bar.y + short_edge * 0.05, 5);
+    }
+
+    bar.bg_sprite.SetOpacity(0);
+    bar.fg_sprite.SetOpacity(0);
+    message.sprite.SetOpacity(0);
+}
+Plymouth.SetDisplayPasswordFunction(on_display_password);
+
+fun on_display_normal() {
+    clear_bullets();
+    prompt.sprite.SetOpacity(0);
+    bar.bg_sprite.SetOpacity(1);
+    bar.fg_sprite.SetOpacity(1);
+    message.sprite.SetOpacity(1);
+    refresh_bar(progress);
+}
+Plymouth.SetDisplayNormalFunction(on_display_normal);
+
+# ---------------------------------------------------------------------------
+# Shutdown / reboot
+# ---------------------------------------------------------------------------
+fun on_quit() {
+    bar.bg_sprite.SetOpacity(0);
+    bar.fg_sprite.SetOpacity(0);
+    message.sprite.SetOpacity(0);
+}
+Plymouth.SetQuitFunction(on_quit);
+
+refresh_bar(0);

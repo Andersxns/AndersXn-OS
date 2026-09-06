@@ -1,0 +1,100 @@
+// AndersXn OS - system fetch configuration.
+//
+// Installed to /etc/fastfetch/config.jsonc and symlinked from
+// /etc/skel/.config/fastfetch/config.jsonc so every new operator inherits it.
+//
+// The logo is loaded from a FILE rather than inlined here on purpose: the mark
+// is drawn in '$' and '@' glyphs, which would otherwise need escaping in JSON
+// and would drift out of sync with branding/ascii/. One source of truth.
+{
+  "$schema": "https://github.com/fastfetch-cli/fastfetch/raw/dev/doc/json_schema.json",
+
+  "logo": {
+    // "file-raw", not "file": the "file" type treats $ as a colour-placeholder
+    // prefix and eats characters, and this mark is almost entirely $ - it
+    // renders as shredded nonsense. "file-raw" prints the bytes verbatim.
+    //
+    // The trade-off is that file-raw applies no colour of its own, so the
+    // accent is baked into the .ansi file, which build stage 30 generates from
+    // axos-logo-compact.txt. That file stays the single source of the art.
+    "source": "/usr/share/andersxn/ascii/axos-logo-compact.ansi",
+    "type": "file-raw",
+    "padding": { "top": 1, "left": 2, "right": 3 }
+  },
+
+  "display": {
+    "separator": "  ",
+    "color": { "keys": "38;2;79;195;247", "title": "38;2;242;245;250" },
+    "key": { "width": 10 },
+    "percent": { "type": ["bar", "num"] },
+
+    // "borderLeft"/"borderRight", not "border": fastfetch dropped the boolean
+    // form and now silently ignores it, so a "border": false here still drew
+    // the [ ] brackets. Empty strings are the supported way to remove them.
+    //
+    // The two characters are deliberately different glyphs rather than the
+    // "=" and "-" this used to use. On a 16GB board an idle system sits near
+    // 4% of RAM, which rounds to zero filled segments, and a bar of nothing
+    // but "-" does not read as a bar at all - it reads as broken. A shaded
+    // track always looks like a gauge, whether or not anything fills it.
+    "bar": {
+      "charElapsed": "█",
+      "charTotal": "░",
+      "borderLeft": "",
+      "borderRight": "",
+      "width": 16
+    }
+  },
+
+  "modules": [
+    { "type": "title", "format": "{user-name}@{host-name}" },
+    "separator",
+
+    { "type": "os",       "key": "os",     "format": "{name} {version-id} ({codename}) {arch}" },
+    { "type": "kernel",   "key": "kernel" },
+    { "type": "host",     "key": "host" },
+    { "type": "uptime",   "key": "uptime" },
+    { "type": "packages", "key": "pkgs" },
+    { "type": "shell",    "key": "shell" },
+
+    "break",
+
+    { "type": "cpu",    "key": "cpu",  "temp": true },
+    { "type": "gpu",    "key": "gpu",  "detectionMethod": "auto" },
+    { "type": "memory", "key": "mem" },
+    // num-only: these images ship without swap, and the global bar setting
+    // otherwise draws a full-width empty gauge next to the word "Disabled".
+    // Keeping the row means it still reports a swapfile or zram if one is
+    // added later, without pretending to measure something that is not there.
+    { "type": "swap",   "key": "swap", "percent": { "type": ["num"] } },
+    { "type": "disk",   "key": "disk", "folders": "/:/srv/andersxn" },
+
+    "break",
+
+    { "type": "localip",   "key": "lan",  "showIpv4": true, "showIpv6": false, "compact": true },
+    { "type": "publicip",  "key": "wan",  "timeout": 500 },
+
+    "break",
+
+    // Homelab-specific rows. These are "command" modules rather than built-ins
+    // so they degrade to nothing when the service is not provisioned.
+    {
+      "type": "command",
+      "key": "docker",
+      "text": "command -v docker >/dev/null 2>&1 && [ -S /run/docker.sock ] && printf '%s running / %s total' \"$(docker ps -q 2>/dev/null | wc -l)\" \"$(docker ps -aq 2>/dev/null | wc -l)\" || exit 1"
+    },
+    {
+      "type": "command",
+      "key": "k3s",
+      "text": "systemctl is-active --quiet k3s 2>/dev/null && kubectl get nodes --no-headers 2>/dev/null | wc -l | sed 's/$/ node(s)/' || exit 1"
+    },
+    {
+      "type": "command",
+      "key": "tailscale",
+      "text": "command -v tailscale >/dev/null 2>&1 && tailscale ip -4 2>/dev/null | head -1 || exit 1"
+    },
+
+    "break",
+    "colors"
+  ]
+}

@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+#
+# Stage 10 - bootstrap the base root filesystem.
+#
+# Uses mmdebstrap rather than plain debootstrap: it runs the whole bootstrap in
+# one pass, supports foreign architectures directly, and lets us inject the
+# AndersXn apt configuration as part of the bootstrap instead of fixing it up
+# afterwards. The result is a minimal tree with no recommends, no documentation
+# and no translations - the bloat is never installed rather than deleted later.
+
+set -euo pipefail
+AXOS_ROOT="${AXOS_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)}"
+# shellcheck source=../lib/common.sh
+source "$AXOS_ROOT/build/lib/common.sh"
+# shellcheck source=../config/build.conf
+source "$AXOS_ROOT/build/config/build.conf"
+
+require_root
+trap 'axos_umount_all' EXIT INT TERM
+
+if [[ -e "$AXOS_ROOTFS/usr/bin/apt" ]]; then
+    info "rootfs already bootstrapped at $AXOS_ROOTFS - skipping"
+    info "(remove it or run build.sh --clean to force a fresh bootstrap)"
+    exit 0
+fi
+
+mkdir -p "$AXOS_WORKDIR"
+
+# ---------------------------------------------------------------------------
+# apt tuning injected during the bootstrap itself
+# ---------------------------------------------------------------------------
+aptdir="$AXOS_WORKDIR/apt-setup"
+rm -rf -- "$aptdir"; mkdir -p "$aptdir"
+
+cat > "$aptdir/99-axos-lean" <<'CONF'
+# AndersXn OS - keep the base system lean by construction.
+APT::Install-Recommends "false";
+APT::Install-Suggests   "false";
+APT::AutoRemove::RecommendsImportant "false";
+APT::AutoRemove::SuggestsImportant   "false";
+Acquire::Languages "none";
+CONF
+
+cat > "$aptdir/99-axos-nodoc" <<'CONF'
+# Documentation, manpage and locale stripping. A homelab node does not need
+# 300MB of changelogs; "man" pages for installed tools are kept.
+path-exclude /usr/share/doc/*
+path-include /usr/share/doc/*/copyright
+path-exclude /usr/share/info/*
+path-exclude /usr/share/groff/*
+path-exclude /usr/share/lintian/*
+path-exclude /usr/share/locale/*
+path-include /usr/share/locale/en*
+path-include /usr/share/locale/locale.alias
+CONF
+
+log "bootstrapping debian/$AXOS_SUITE for $AXOS_ARCH"
+info "mirror:  $AXOS_MIRROR"
+info "keyring: $AXOS_KEYRING"
+
+[[ -r "$AXOS_KEYRING" ]] || die "archive keyring not found: $AXOS_KEYRING
+    On a non-Debian build host, install it with:
+        apt-get install debian-archive-keyring
+    or point AXOS_KEYRING at the right file."
+
+# Every source line carries signed-by explicitly. Leaving it to apt's default
+# keyring only works when the build host is itself Debian; on an Ubuntu host
+# the default keyring holds Ubuntu's keys and every Debian Release file fails
+# verification with NO_PUBKEY.
+sb="[signed-by=$AXOS_KEYRING]"
+
+# One bootstrap attempt.
+#
+# Wrapped in a function because mmdebstrap refuses a non-empty target: a failed
+# attempt leaves a partial tree behind, so a retry has to clear it first, or
+# every retry after the first fails for the wrong reason.
+bootstrap_once() {
+    rm -rf -- "$AXOS_ROOTFS"
+    mkdir -p "$AXOS_ROOTFS"
+
+    mmdebstrap \
+        --architectures="$AXOS_ARCH" \
+        --variant=minbase \
+        --components="$AXOS_COMPONENTS" \
+        --include="$AXOS_PKGS_BASE" \
+        --keyring="$AXOS_KEYRING" \
+        --setup-hook='mkdir -p "$1"/etc/apt/apt.conf.d "$1"/etc/dpkg/dpkg.cfg.d' \
+        --setup-hook="cp '$aptdir/99-axos-lean' \"\$1\"/etc/apt/apt.conf.d/99-axos-lean" \
+        --setup-hook="cp '$aptdir/99-axos-nodoc' \"\$1\"/etc/dpkg/dpkg.cfg.d/99-axos-nodoc" \
+        --customize-hook='chroot "$1" /usr/sbin/useradd --system --home-dir /nonexistent --shell /usr/sbin/nologin axos-build 2>/dev/null || true' \
+        "$AXOS_SUITE" \
+        "$AXOS_ROOTFS" \
+        "deb $sb $AXOS_MIRROR $AXOS_SUITE $AXOS_COMPONENTS" \
+        "deb $sb $AXOS_SECURITY_MIRROR ${AXOS_SUITE}-security $AXOS_COMPONENTS" \
+        "deb $sb $AXOS_MIRROR ${AXOS_SUITE}-updates $AXOS_COMPONENTS"
+}
+
+axos_retry 3 bootstrap_once
+
+[[ -x "$AXOS_ROOTFS/usr/bin/apt" ]] || die "bootstrap produced no usable rootfs"
+
+# ---------------------------------------------------------------------------
+# Filesystem layout that the rest of the build (and AX-Installer) relies on
+# ---------------------------------------------------------------------------
+log "creating AndersXn filesystem layout"
+install -dm0755 "$AXOS_ROOTFS/etc/andersxn"
+install -dm0755 "$AXOS_ROOTFS/usr/share/andersxn"
+install -dm0755 "$AXOS_ROOTFS/usr/share/andersxn/ascii"
+install -dm0755 "$AXOS_ROOTFS/usr/share/andersxn/assets"
+install -dm0755 "$AXOS_ROOTFS/usr/lib/andersxn"
+install -dm0755 "$AXOS_ROOTFS/var/lib/andersxn"
+install -dm0755 "$AXOS_ROOTFS/etc/andersxn/provision.d"
+# Homelab convention: bind-mountable service data root, one directory per stack.
+install -dm0755 "$AXOS_ROOTFS/srv/andersxn"
+install -dm0755 "$AXOS_ROOTFS/srv/andersxn/compose"
+install -dm0755 "$AXOS_ROOTFS/srv/andersxn/data"
+
+# Record what produced this tree; consumed by stage 20 and by ax-release(1).
+cat > "$AXOS_ROOTFS/etc/andersxn/build-manifest" <<MANIFEST
+# Generated by build/stages/10-bootstrap.sh - do not edit.
+AXOS_VERSION=$AXOS_VERSION
+AXOS_CODENAME=$AXOS_CODENAME
+AXOS_ARCH=$AXOS_ARCH
+AXOS_BASE=debian/$AXOS_SUITE
+AXOS_BOOTLOADER=$AXOS_BOOTLOADER
+AXOS_BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+AXOS_BUILD_HOST=$(uname -srm)
+MANIFEST
+
+du_mib=$(du -sm "$AXOS_ROOTFS" | cut -f1)
+ok "base rootfs ready (${du_mib}MiB) at $AXOS_ROOTFS"

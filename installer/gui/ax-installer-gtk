@@ -1,0 +1,1201 @@
+#!/usr/bin/env python3
+"""
+AndersXn OS - graphical installer.
+
+A GTK4 front end over the same engine the text installer uses. It never touches
+a disk itself: it drives `ax-installer` through the JSON protocol in
+installer/internal/api,
+
+    ax-installer --probe                 -> machine + catalog, as JSON
+    ax-installer --run-plan <file>       -> newline-delimited progress events
+
+which is why this is Python rather than Go. AndersXn images are routinely
+cross-built, and a compiled toolkit binding (gotk4, Fyne) would drag a full
+cross-compiled GTK stack into the build for no benefit. PyGObject needs no
+compilation, so the graphical front end costs the build nothing and stays
+readable - and patchable - on the live medium itself.
+
+The GUI runs unprivileged. Only the install step escalates, through sudo (the
+live session has a NOPASSWD rule) or pkexec.
+"""
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+from gi.repository import Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
+
+# --- brand palette (mirrors build/lib/common.sh) ---------------------------
+INK = "#0B0E14"
+SURFACE = "#131722"
+SNOW = "#F2F5FA"
+ACCENT = "#4FC3F7"
+ACCENT_DEEP = "#1B6CA8"
+MUTED = "#6B7A90"
+OK = "#63D68A"
+WARN = "#E8B84B"
+ERR = "#E5484D"
+
+LOGO_PNG = "/usr/share/andersxn/assets/AXnobg.png"
+BACKEND = "ax-installer"
+
+CSS = """
+window, .axos-root {{ background: {ink}; color: {snow}; }}
+
+.axos-sidebar {{
+    background: {surface};
+    border-right: 1px solid {accent_deep};
+}}
+.axos-step {{
+    color: {muted};
+    padding: 8px 18px;
+    font-size: 13px;
+}}
+.axos-step-active {{
+    color: {accent};
+    font-weight: 700;
+    border-left: 3px solid {accent};
+    background: alpha({accent}, 0.08);
+}}
+.axos-step-done {{ color: {ok}; }}
+
+.axos-title {{ font-size: 22px; font-weight: 700; color: {snow}; }}
+.axos-subtitle {{ color: {muted}; font-size: 13px; }}
+.axos-section {{ color: {accent}; font-weight: 700; font-size: 12px; }}
+.axos-muted {{ color: {muted}; }}
+.axos-warn {{ color: {warn}; }}
+.axos-err {{ color: {err}; }}
+.axos-ok {{ color: {ok}; }}
+.axos-mono {{ font-family: "JetBrains Mono", monospace; font-size: 12px; }}
+
+.axos-card {{
+    background: {surface};
+    border: 1px solid alpha({accent_deep}, 0.6);
+    border-radius: 10px;
+    padding: 10px;
+}}
+.axos-card-selected {{
+    border-color: {accent};
+    background: alpha({accent}, 0.10);
+}}
+
+.axos-danger {{
+    background: alpha({err}, 0.12);
+    border: 1px solid {err};
+    border-radius: 8px;
+    padding: 10px;
+}}
+
+button.axos-primary {{
+    background: {accent};
+    color: {ink};
+    font-weight: 700;
+    border-radius: 8px;
+    padding: 8px 22px;
+    border: none;
+}}
+button.axos-primary:hover {{ background: #6FD0FA; }}
+button.axos-primary:disabled {{ background: {accent_deep}; color: {muted}; }}
+
+button.axos-ghost {{
+    background: transparent;
+    color: {muted};
+    border: 1px solid {accent_deep};
+    border-radius: 8px;
+    padding: 8px 22px;
+}}
+button.axos-ghost:hover {{ color: {snow}; border-color: {accent}; }}
+
+entry {{
+    background: {ink};
+    color: {snow};
+    border: 1px solid {accent_deep};
+    border-radius: 6px;
+    padding: 7px 10px;
+}}
+entry:focus {{ border-color: {accent}; }}
+
+textview, textview text {{
+    background: {ink};
+    color: {muted};
+    font-family: "JetBrains Mono", monospace;
+    font-size: 11px;
+}}
+progressbar progress {{ background: {accent}; }}
+progressbar trough {{ background: {surface}; }}
+""".format(
+    ink=INK, surface=SURFACE, snow=SNOW, accent=ACCENT,
+    accent_deep=ACCENT_DEEP, muted=MUTED, ok=OK, warn=WARN, err=ERR,
+)
+
+STEPS = [
+    "Welcome", "Disk", "Layout", "System",
+    "Account", "Software", "Review", "Install",
+]
+
+
+# ---------------------------------------------------------------------------
+# Backend plumbing
+# ---------------------------------------------------------------------------
+def backend_path():
+    """Locate ax-installer, preferring PATH and falling back to the live ISO."""
+    found = shutil.which(BACKEND)
+    if found:
+        return found
+    for candidate in ("/usr/bin/ax-installer", "/usr/local/bin/ax-installer"):
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def probe():
+    """Ask the engine what this machine looks like."""
+    exe = backend_path()
+    if exe is None:
+        return None, "ax-installer was not found on PATH"
+    try:
+        out = subprocess.run(
+            [exe, "--probe"], capture_output=True, text=True, timeout=60, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, "running ax-installer --probe: %s" % exc
+    if out.returncode != 0:
+        return None, (out.stderr or "ax-installer --probe failed").strip()
+    try:
+        return json.loads(out.stdout), None
+    except json.JSONDecodeError as exc:
+        return None, "ax-installer --probe returned invalid JSON: %s" % exc
+
+
+def escalation_prefix():
+    """
+    How to become root for the install step.
+
+    The GUI itself runs unprivileged so a crash in the UI cannot damage a disk;
+    only the install subprocess is escalated. On the live medium sudo is
+    passwordless (see build/stages/25-desktop.sh); pkexec covers an installed
+    system where an operator launched the installer by hand.
+    """
+    if os.geteuid() == 0:
+        return []
+    if shutil.which("sudo"):
+        probe_sudo = subprocess.run(
+            ["sudo", "-n", "true"], capture_output=True, check=False
+        )
+        if probe_sudo.returncode == 0:
+            return ["sudo", "-n"]
+    if shutil.which("pkexec"):
+        return ["pkexec"]
+    if shutil.which("sudo"):
+        return ["sudo"]
+    return []
+
+
+def human_gib(n):
+    return "%d GiB" % n
+
+
+# ---------------------------------------------------------------------------
+# System value lists
+#
+# Timezone, locale and keymap are picked from lists rather than typed. Typing
+# them is a trap: "Europe/London" is easy, but the installer silently accepts
+# "GMT+1" or "en_GB.utf8" and the mistake only surfaces on the installed
+# machine. Each list is read from the live system, with a fallback so a missing
+# data file degrades to a short usable list instead of an empty dropdown.
+# ---------------------------------------------------------------------------
+def _run(argv):
+    try:
+        out = subprocess.run(argv, capture_output=True, text=True,
+                             timeout=15, check=False)
+        return out.stdout if out.returncode == 0 else ""
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def list_timezones():
+    out = _run(["timedatectl", "list-timezones"])
+    zones = [z.strip() for z in out.splitlines() if z.strip()]
+    if zones:
+        return zones
+
+    # zone1970.tab column 3 is the zone name; it omits the legacy aliases that
+    # walking the whole zoneinfo tree would pull in.
+    for tab in ("/usr/share/zoneinfo/zone1970.tab", "/usr/share/zoneinfo/zone.tab"):
+        try:
+            with open(tab, encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith("#"):
+                        continue
+                    parts = line.split("	")
+                    if len(parts) >= 3 and parts[2].strip():
+                        zones.append(parts[2].strip())
+        except OSError:
+            continue
+        if zones:
+            break
+
+    if not zones:
+        zones = ["UTC", "Europe/London", "Europe/Oslo", "America/New_York"]
+    zones = sorted(set(zones))
+    if "UTC" not in zones:
+        zones.insert(0, "UTC")
+    return zones
+
+
+def list_locales():
+    locales = []
+    try:
+        with open("/usr/share/i18n/SUPPORTED", encoding="utf-8") as fh:
+            for line in fh:
+                name = line.split()[0] if line.split() else ""
+                # UTF-8 only: shipping a latin-1 default in 2026 would be a
+                # disservice, and the list is long enough already.
+                if name.endswith(".UTF-8"):
+                    locales.append(name)
+    except OSError:
+        pass
+    if not locales:
+        locales = ["en_US.UTF-8", "en_GB.UTF-8", "de_DE.UTF-8", "fr_FR.UTF-8"]
+    return sorted(set(locales))
+
+
+def list_keyboard_layouts():
+    """
+    Keyboard layouts, as (code, description) pairs.
+
+    Read from xkb-data rather than /usr/share/keymaps. Debian no longer ships
+    the old console keymap tree - console-setup generates console maps from
+    this same XKB data - and on a desktop the XKB layout is the one that
+    actually governs what the keys do. The installer writes it to both
+    /etc/default/keyboard and /etc/vconsole.conf so console and desktop agree.
+    """
+    layouts = []
+    try:
+        with open("/usr/share/X11/xkb/rules/base.lst", encoding="utf-8") as fh:
+            in_section = False
+            for line in fh:
+                if line.startswith("! layout"):
+                    in_section = True
+                    continue
+                if line.startswith("!"):
+                    in_section = False
+                if not in_section or not line.strip():
+                    continue
+                parts = line.split(None, 1)
+                if len(parts) == 2:
+                    layouts.append((parts[0].strip(), parts[1].strip()))
+    except OSError:
+        pass
+
+    if not layouts:
+        layouts = [("us", "English (US)"), ("gb", "English (UK)"),
+                   ("de", "German"), ("fr", "French"), ("es", "Spanish"),
+                   ("no", "Norwegian"), ("se", "Swedish"), ("dk", "Danish")]
+
+    # Sort by description, but keep US first: it is the default and the one
+    # most operators want at the top rather than hunting for.
+    layouts.sort(key=lambda kv: (kv[0] != "us", kv[1]))
+    return layouts
+
+
+# ---------------------------------------------------------------------------
+# Small widget helpers
+# ---------------------------------------------------------------------------
+def label(text, css=None, wrap=True, xalign=0.0):
+    lb = Gtk.Label(label=text)
+    lb.set_xalign(xalign)
+    lb.set_wrap(wrap)
+    lb.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+    if css:
+        for cls in css.split():
+            lb.add_css_class(cls)
+    return lb
+
+
+def vbox(spacing=10, margin=0):
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=spacing)
+    if margin:
+        box.set_margin_top(margin)
+        box.set_margin_bottom(margin)
+        box.set_margin_start(margin)
+        box.set_margin_end(margin)
+    return box
+
+
+def hbox(spacing=10):
+    return Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=spacing)
+
+
+class Choice:
+    """
+    A searchable dropdown over a list of strings.
+
+    Gtk.DropDown needs an expression before it will enable its search entry,
+    which is the difference between usable and unusable when the list is 400
+    timezones long.
+    """
+
+    def __init__(self, items, selected=None, labels=None):
+        self.items = list(items)
+        shown = list(labels) if labels else self.items
+        self.widget = Gtk.DropDown(model=Gtk.StringList.new(shown))
+        self.widget.set_enable_search(True)
+        self.widget.set_expression(
+            Gtk.PropertyExpression.new(Gtk.StringObject, None, "string"))
+        if selected in self.items:
+            self.widget.set_selected(self.items.index(selected))
+
+    def value(self):
+        i = self.widget.get_selected()
+        if 0 <= i < len(self.items):
+            return self.items[i]
+        return self.items[0] if self.items else ""
+
+
+def form_row(text, widget):
+    row = hbox(12)
+    lb = label(text, "axos-muted")
+    lb.set_size_request(150, -1)
+    row.append(lb)
+    widget.set_hexpand(True)
+    row.append(widget)
+    return row
+
+
+# ---------------------------------------------------------------------------
+# The wizard window
+# ---------------------------------------------------------------------------
+class InstallerWindow(Gtk.ApplicationWindow):
+    def __init__(self, app, info, probe_error):
+        super().__init__(application=app)
+        self.info = info or {}
+        self.probe_error = probe_error
+        self.page = 0
+        self.install_started = False
+        self.install_failed = False
+        self.proc = None
+        self._last_was_progress = False
+
+        name = self.info.get("name", "AndersXn OS")
+        version = self.info.get("version", "1.0")
+        self.set_title("%s %s installer" % (name, version))
+        self.set_default_size(1040, 700)
+
+        # The live session runs this as the whole session, with a window
+        # manager and nothing else - no panel, no desktop. Fullscreen there
+        # so it does not float on a bare root window; windowed when someone
+        # launches it from an installed system's menu.
+        if os.environ.get("AXOS_INSTALLER_KIOSK") == "1":
+            self.fullscreen()
+
+        # Selection state
+        self.disks = self.info.get("disks", [])
+        self.modules = self.info.get("modules", [])
+        self.sel_disk = self.disks[0]["path"] if self.disks else ""
+        self.sel_scheme = "wipe"
+        self.sel_fs = self.info.get("defaults", {}).get("fs", "btrfs")
+        self.sel_encrypt = False
+        self.sel_modules = {
+            m["id"]: bool(m.get("default_on")) for m in self.modules
+        }
+
+        root = hbox(0)
+        root.add_css_class("axos-root")
+        self.set_child(root)
+
+        root.append(self._build_sidebar())
+
+        right = vbox(0)
+        right.set_hexpand(True)
+        self.stack = Gtk.Stack()
+        self.stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
+        self.stack.set_transition_duration(160)
+        self.stack.set_vexpand(True)
+        right.append(self.stack)
+        right.append(self._build_actionbar())
+        root.append(right)
+
+        self._build_pages()
+        self._show_page(0)
+
+    # --- sidebar -----------------------------------------------------------
+    def _build_sidebar(self):
+        side = vbox(4)
+        side.add_css_class("axos-sidebar")
+        side.set_size_request(240, -1)
+
+        logo_box = vbox(6, margin=20)
+        if os.path.exists(LOGO_PNG):
+            pic = Gtk.Picture.new_for_filename(LOGO_PNG)
+            pic.set_size_request(120, 120)
+            pic.set_can_shrink(True)
+            logo_box.append(pic)
+        title = label(self.info.get("name", "AndersXn OS"), "axos-title", xalign=0.5)
+        title.set_justify(Gtk.Justification.CENTER)
+        logo_box.append(title)
+        logo_box.append(label(
+            "%s (%s)" % (self.info.get("version", ""), self.info.get("codename", "")),
+            "axos-subtitle", xalign=0.5))
+        side.append(logo_box)
+
+        self.step_labels = []
+        for i, step in enumerate(STEPS):
+            lb = label("%d.  %s" % (i + 1, step), "axos-step")
+            side.append(lb)
+            self.step_labels.append(lb)
+
+        spacer = vbox()
+        spacer.set_vexpand(True)
+        side.append(spacer)
+
+        foot = vbox(2, margin=16)
+        foot.append(label("%s  %s" % (
+            self.info.get("firmware", "?"), self.info.get("arch", "?")),
+            "axos-muted"))
+        side.append(foot)
+        return side
+
+    def _build_actionbar(self):
+        bar = hbox(10)
+        bar.set_margin_top(14)
+        bar.set_margin_bottom(18)
+        bar.set_margin_start(28)
+        bar.set_margin_end(28)
+
+        self.btn_back = Gtk.Button(label="Back")
+        self.btn_back.add_css_class("axos-ghost")
+        self.btn_back.connect("clicked", self.on_back)
+        bar.append(self.btn_back)
+
+        gap = hbox()
+        gap.set_hexpand(True)
+        bar.append(gap)
+
+        self.hint = label("", "axos-muted", xalign=1.0)
+        bar.append(self.hint)
+
+        self.btn_next = Gtk.Button(label="Next")
+        self.btn_next.add_css_class("axos-primary")
+        self.btn_next.connect("clicked", self.on_next)
+        bar.append(self.btn_next)
+        return bar
+
+    # --- pages -------------------------------------------------------------
+    def _page(self, title, subtitle):
+        outer = vbox(14, margin=28)
+        outer.append(label(title, "axos-title"))
+        if subtitle:
+            outer.append(label(subtitle, "axos-subtitle"))
+        return outer
+
+    def _scroller(self, child):
+        sc = Gtk.ScrolledWindow()
+        sc.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        sc.set_vexpand(True)
+        sc.set_child(child)
+        return sc
+
+    def _build_pages(self):
+        self.stack.add_named(self._page_welcome(), "0")
+        self.stack.add_named(self._page_disk(), "1")
+        self.stack.add_named(self._page_layout(), "2")
+        self.stack.add_named(self._page_system(), "3")
+        self.stack.add_named(self._page_account(), "4")
+        self.stack.add_named(self._page_software(), "5")
+        self.stack.add_named(self._page_review(), "6")
+        self.stack.add_named(self._page_install(), "7")
+
+    def _page_welcome(self):
+        p = self._page("Welcome",
+                       "This will install %s on this machine."
+                       % self.info.get("name", "AndersXn OS"))
+        grid = vbox(6)
+        for k, v in (
+            ("Firmware", self.info.get("firmware", "unknown")),
+            ("Architecture", self.info.get("arch", "unknown")),
+            ("Live medium", "yes" if self.info.get("is_live") else "no"),
+        ):
+            row = hbox(10)
+            lb = label(k, "axos-muted")
+            lb.set_size_request(140, -1)
+            row.append(lb)
+            row.append(label(v))
+            grid.append(row)
+        p.append(grid)
+
+        if self.probe_error:
+            p.append(label("Could not inspect this machine: %s" % self.probe_error,
+                           "axos-err"))
+            return p
+
+        warning = self.info.get("warning", "")
+
+        # The backend reports "not running as root" because the GUI genuinely is
+        # unprivileged - deliberately, so a crash in the UI cannot touch a disk.
+        # Only the install step escalates. Repeating the backend's warning here
+        # would tell the operator their install is doomed when it is not; it is
+        # only worth saying when we actually cannot become root.
+        if "not running as root" in warning:
+            if escalation_prefix():
+                warning = ""
+            else:
+                warning = ("This session cannot obtain root: neither sudo nor "
+                           "pkexec is available. The install will fail at the "
+                           "first write.")
+
+        if warning:
+            p.append(label(warning, "axos-warn"))
+        return p
+
+    def _page_disk(self):
+        p = self._page("Select a disk",
+                       "Everything on the chosen disk will be erased.")
+        body = vbox(10)
+        if not self.disks:
+            body.append(label(
+                "No installable disks were found. AndersXn needs a disk of at "
+                "least 2 GiB.", "axos-err"))
+        self.disk_buttons = []
+        first = None
+        for d in self.disks:
+            btn = Gtk.CheckButton()
+            if first is None:
+                first = btn
+            else:
+                btn.set_group(first)
+            btn.set_active(d["path"] == self.sel_disk)
+
+            inner = vbox(2)
+            inner.append(label("%s   %s" % (d["path"], d.get("size_human", ""))))
+            inner.append(label(d.get("describe", ""), "axos-muted"))
+            if d.get("mounted"):
+                inner.append(label(
+                    "This disk has mounted partitions - it may be the medium "
+                    "you booted from.", "axos-warn"))
+            for part in d.get("partitions", []):
+                inner.append(label(
+                    "    %s   %s   %s%s" % (
+                        part["path"], part.get("size_human", ""),
+                        part.get("fstype") or "unformatted",
+                        "   mounted at " + part["mountpoint"] if part.get("mountpoint") else ""),
+                    "axos-muted axos-mono"))
+
+            card = hbox(12)
+            card.add_css_class("axos-card")
+            card.append(btn)
+            inner.set_hexpand(True)
+            card.append(inner)
+            btn.connect("toggled", self._on_disk_toggled, d["path"], card)
+            if d["path"] == self.sel_disk:
+                card.add_css_class("axos-card-selected")
+            body.append(card)
+            self.disk_buttons.append((btn, card, d["path"]))
+        p.append(self._scroller(body))
+        return p
+
+    def _on_disk_toggled(self, btn, path, card):
+        if not btn.get_active():
+            return
+        self.sel_disk = path
+        for _b, c, pth in self.disk_buttons:
+            if pth == path:
+                c.add_css_class("axos-card-selected")
+            else:
+                c.remove_css_class("axos-card-selected")
+
+    def _radio_group(self, container, options, selected, on_pick):
+        """options: list of (value, title, description)."""
+        first = None
+        cards = {}
+        for value, title, desc in options:
+            btn = Gtk.CheckButton()
+            if first is None:
+                first = btn
+            else:
+                btn.set_group(first)
+            btn.set_active(value == selected)
+
+            inner = vbox(2)
+            inner.append(label(title))
+            inner.append(label(desc, "axos-muted"))
+            inner.set_hexpand(True)
+
+            card = hbox(12)
+            card.add_css_class("axos-card")
+            if value == selected:
+                card.add_css_class("axos-card-selected")
+            card.append(btn)
+            card.append(inner)
+            container.append(card)
+            cards[value] = card
+
+            def handler(b, v=value):
+                if not b.get_active():
+                    return
+                on_pick(v)
+                for k, c in cards.items():
+                    if k == v:
+                        c.add_css_class("axos-card-selected")
+                    else:
+                        c.remove_css_class("axos-card-selected")
+
+            btn.connect("toggled", handler)
+        return cards
+
+    def _page_layout(self):
+        p = self._page("Disk layout", "How the target disk is organised.")
+        body = vbox(14)
+
+        body.append(label("PARTITIONING", "axos-section"))
+        self._radio_group(body, [
+            ("wipe", "Erase disk",
+             "Wipe the whole disk and use all of it. Everything on it is lost."),
+            ("manual", "Use existing partitions",
+             "You have already made a root partition and a FAT boot partition."),
+        ], self.sel_scheme, self._set_scheme)
+
+        body.append(label("ROOT FILESYSTEM", "axos-section"))
+        self._radio_group(body, [
+            ("btrfs", "btrfs  (recommended)",
+             "Subvolumes, snapshots and zstd compression. The AndersXn default."),
+            ("ext4", "ext4",
+             "Conservative and universally understood. No snapshots."),
+            ("xfs", "xfs",
+             "Strong with large files and parallel I/O. No shrink, no snapshots."),
+        ], self.sel_fs, self._set_fs)
+
+        body.append(label("ENCRYPTION", "axos-section"))
+        enc_card = hbox(12)
+        enc_card.add_css_class("axos-card")
+        self.chk_encrypt = Gtk.CheckButton()
+        self.chk_encrypt.set_active(self.sel_encrypt)
+        self.chk_encrypt.connect("toggled", self._on_encrypt_toggled)
+        enc_inner = vbox(6)
+        enc_inner.set_hexpand(True)
+        enc_inner.append(label("Encrypt the root filesystem with LUKS2"))
+        enc_inner.append(label(
+            "You will be asked to unlock the disk at every boot.", "axos-muted"))
+        self.luks_entry = Gtk.PasswordEntry()
+        self.luks_entry.set_show_peek_icon(True)
+        self.luks_entry.set_property("placeholder-text", "Passphrase (min 8 characters)")
+        self.luks_entry.set_visible(self.sel_encrypt)
+        self.luks_confirm = Gtk.PasswordEntry()
+        self.luks_confirm.set_show_peek_icon(True)
+        self.luks_confirm.set_property("placeholder-text", "Confirm passphrase")
+        self.luks_confirm.set_visible(self.sel_encrypt)
+        enc_inner.append(self.luks_entry)
+        enc_inner.append(self.luks_confirm)
+        enc_card.append(self.chk_encrypt)
+        enc_card.append(enc_inner)
+        body.append(enc_card)
+
+        p.append(self._scroller(body))
+        return p
+
+    def _set_scheme(self, v):
+        self.sel_scheme = v
+
+    def _set_fs(self, v):
+        self.sel_fs = v
+
+    def _on_encrypt_toggled(self, btn):
+        self.sel_encrypt = btn.get_active()
+        self.luks_entry.set_visible(self.sel_encrypt)
+        self.luks_confirm.set_visible(self.sel_encrypt)
+
+    def _page_system(self):
+        p = self._page("System settings",
+                       "Identity and localisation for the installed machine.")
+        d = self.info.get("defaults", {})
+        body = vbox(12)
+
+        # Hostname stays free text - it is genuinely arbitrary. The other three
+        # are picked from what this system actually supports.
+        self.e_hostname = Gtk.Entry(text=d.get("hostname", "andersxn"))
+        self.c_timezone = Choice(list_timezones(), d.get("timezone", "UTC"))
+        self.c_locale = Choice(list_locales(), d.get("locale", "en_US.UTF-8"))
+        layouts = list_keyboard_layouts()
+        self.c_keymap = Choice(
+            [code for code, _desc in layouts],
+            d.get("keymap", "us"),
+            labels=["%s  -  %s" % (code, desc) for code, desc in layouts])
+
+        body.append(form_row("Hostname", self.e_hostname))
+        body.append(form_row("Timezone", self.c_timezone.widget))
+        body.append(form_row("Locale", self.c_locale.widget))
+        body.append(form_row("Keyboard layout", self.c_keymap.widget))
+        body.append(label(
+            "Type in any of the lists above to search them.", "axos-muted"))
+        p.append(body)
+        return p
+
+    def _page_account(self):
+        p = self._page("Operator account",
+                       "Root login is disabled. This account gets sudo.")
+        body = vbox(12)
+        self.e_user = Gtk.Entry()
+        self.e_user.set_property("placeholder-text", "operator")
+        self.e_fullname = Gtk.Entry()
+        self.e_fullname.set_property("placeholder-text", "optional")
+        self.e_pw = Gtk.PasswordEntry()
+        self.e_pw.set_show_peek_icon(True)
+        self.e_pw2 = Gtk.PasswordEntry()
+        self.e_pw2.set_show_peek_icon(True)
+        self.e_sshkey = Gtk.Entry()
+        self.e_sshkey.set_property("placeholder-text", "ssh-ed25519 AAAA...  (optional)")
+
+        body.append(form_row("Username", self.e_user))
+        body.append(form_row("Full name", self.e_fullname))
+        body.append(form_row("Password", self.e_pw))
+        body.append(form_row("Confirm password", self.e_pw2))
+        body.append(form_row("SSH public key", self.e_sshkey))
+        body.append(label(
+            "If you supply an SSH key, password authentication over SSH is "
+            "disabled automatically.", "axos-muted"))
+        p.append(body)
+        return p
+
+    def _page_software(self):
+        p = self._page("Software",
+                       "Stacks deployed automatically after the base install.")
+        body = vbox(8)
+        self.module_detail = label("", "axos-muted")
+
+        current_cat = None
+        for m in self.modules:
+            if m.get("category") != current_cat:
+                current_cat = m.get("category")
+                body.append(label((current_cat or "").upper(), "axos-section"))
+
+            chk = Gtk.CheckButton()
+            chk.set_active(self.sel_modules.get(m["id"], False))
+            chk.connect("toggled", self._on_module_toggled, m["id"])
+
+            inner = vbox(2)
+            inner.set_hexpand(True)
+            head = hbox(8)
+            head.append(label(m["name"]))
+            if m.get("disk_gib"):
+                head.append(label("~" + human_gib(m["disk_gib"]), "axos-muted"))
+            inner.append(head)
+            inner.append(label(m.get("summary", ""), "axos-muted"))
+            inner.append(label(m.get("detail", ""), "axos-muted"))
+
+            card = hbox(12)
+            card.add_css_class("axos-card")
+            card.append(chk)
+            card.append(inner)
+            body.append(card)
+
+        self.software_note = label("", "axos-warn")
+        body.append(self.software_note)
+        p.append(self._scroller(body))
+        return p
+
+    def _on_module_toggled(self, btn, module_id):
+        self.sel_modules[module_id] = btn.get_active()
+        self._refresh_software_note()
+
+    def _selected_module_ids(self):
+        return [m["id"] for m in self.modules if self.sel_modules.get(m["id"])]
+
+    def _resolve_requires(self, ids):
+        """Expand a selection to a fixed point, as the engine does."""
+        by_id = {m["id"]: m for m in self.modules}
+        chosen = set(ids)
+        added = set()
+        changed = True
+        while changed:
+            changed = False
+            for mid in list(chosen):
+                for req in by_id.get(mid, {}).get("requires", []) or []:
+                    if req not in chosen:
+                        chosen.add(req)
+                        added.add(req)
+                        changed = True
+        ordered = [m["id"] for m in self.modules if m["id"] in chosen]
+        return ordered, sorted(added)
+
+    def _refresh_software_note(self):
+        ids = self._selected_module_ids()
+        full, added = self._resolve_requires(ids)
+        notes = []
+        if added:
+            notes.append("Also installing (required): " + ", ".join(added))
+        if "docker" in full and "k3s" in full:
+            notes.append(
+                "Docker and K3s both manage packet forwarding rules; expect to "
+                "hand-tune nftables if you run both on one node.")
+        self.software_note.set_text("\n".join(notes))
+
+    def _page_review(self):
+        p = self._page("Review", "Nothing has been written yet.")
+        self.review_box = vbox(6)
+        p.append(self._scroller(self.review_box))
+        self.review_danger = label("", "axos-err")
+        danger = vbox(4)
+        danger.add_css_class("axos-danger")
+        danger.append(self.review_danger)
+        p.append(danger)
+        return p
+
+    def _refresh_review(self):
+        child = self.review_box.get_first_child()
+        while child is not None:
+            nxt = child.get_next_sibling()
+            self.review_box.remove(child)
+            child = nxt
+
+        full, _added = self._resolve_requires(self._selected_module_ids())
+        disk = next((d for d in self.disks if d["path"] == self.sel_disk), {})
+        rows = [
+            ("Disk", "%s   %s" % (self.sel_disk, disk.get("describe", ""))),
+            ("Scheme", self.sel_scheme),
+            ("Filesystem", self.sel_fs),
+            ("Encryption", "LUKS2" if self.sel_encrypt else "none"),
+            ("Firmware", self.info.get("firmware", "?")),
+            ("Bootloader", "Limine"),
+            ("Hostname", self.e_hostname.get_text()),
+            ("Timezone", self.c_timezone.value()),
+            ("Locale", self.c_locale.value()),
+            ("Keyboard", self.c_keymap.value()),
+            ("Account", self.e_user.get_text()),
+            ("Software", ", ".join(full) if full else "none"),
+        ]
+        for k, v in rows:
+            row = hbox(10)
+            lb = label(k, "axos-muted")
+            lb.set_size_request(150, -1)
+            row.append(lb)
+            row.append(label(v))
+            self.review_box.append(row)
+
+        self.review_danger.set_text(
+            "Everything on %s (%s) will be destroyed. This cannot be undone."
+            % (self.sel_disk, disk.get("size_human", "")))
+
+    def _page_install(self):
+        p = self._page("Installing", "")
+        self.install_status = label("Preparing...", "axos-subtitle")
+        p.append(self.install_status)
+
+        self.progress = Gtk.ProgressBar()
+        self.progress.set_show_text(True)
+        p.append(self.progress)
+
+        self.log_view = Gtk.TextView()
+        self.log_view.set_editable(False)
+        self.log_view.set_monospace(True)
+        self.log_view.set_cursor_visible(False)
+        self.log_buffer = self.log_view.get_buffer()
+        sc = Gtk.ScrolledWindow()
+        sc.set_vexpand(True)
+        sc.set_child(self.log_view)
+        p.append(sc)
+        return p
+
+    # --- navigation --------------------------------------------------------
+    def _show_page(self, n):
+        self.page = n
+        self.stack.set_visible_child_name(str(n))
+
+        for i, lb in enumerate(self.step_labels):
+            for cls in ("axos-step-active", "axos-step-done"):
+                lb.remove_css_class(cls)
+            if i < n:
+                lb.add_css_class("axos-step-done")
+            elif i == n:
+                lb.add_css_class("axos-step-active")
+
+        if n == 6:
+            self._refresh_review()
+        if n == 5:
+            self._refresh_software_note()
+
+        self.btn_back.set_visible(0 < n < 7)
+        if n == 6:
+            self.btn_next.set_label("Install now")
+        elif n == 7:
+            self.btn_next.set_label("Reboot")
+            self.btn_next.set_sensitive(False)
+        else:
+            self.btn_next.set_label("Next")
+        self.hint.set_text("")
+
+    def on_back(self, _btn):
+        if self.page > 0:
+            self._show_page(self.page - 1)
+
+    def on_next(self, _btn):
+        if self.page == 7:
+            self._reboot()
+            return
+        if self.page == 6:
+            self._start_install()
+            return
+        err = self._validate(self.page)
+        if err:
+            self.hint.set_text(err)
+            self.hint.remove_css_class("axos-muted")
+            self.hint.add_css_class("axos-err")
+            return
+        self.hint.remove_css_class("axos-err")
+        self._show_page(self.page + 1)
+
+    def _validate(self, page):
+        if page == 1:
+            if not self.sel_disk:
+                return "Select a disk to continue"
+            disk = next((d for d in self.disks if d["path"] == self.sel_disk), {})
+            if disk.get("mounted"):
+                return "That disk has mounted partitions - it may be your live medium"
+        if page == 2 and self.sel_encrypt:
+            pw = self.luks_entry.get_text()
+            if len(pw) < 8:
+                return "Encryption passphrase must be at least 8 characters"
+            if pw != self.luks_confirm.get_text():
+                return "Encryption passphrases do not match"
+        if page == 3:
+            host = self.e_hostname.get_text().strip()
+            if not host:
+                return "Hostname cannot be empty"
+            ok_chars = all(c.isalnum() or c == "-" for c in host)
+            if not ok_chars or host.startswith("-") or host.endswith("-"):
+                return "Hostname may only contain letters, digits and interior hyphens"
+        if page == 4:
+            user = self.e_user.get_text().strip()
+            if not user:
+                return "Username cannot be empty"
+            if user[0].isdigit():
+                return "Username may not start with a digit"
+            if user in ("root", "daemon", "bin", "sys", "nobody"):
+                return "That username is reserved by the system"
+            if not all(c.islower() or c.isdigit() or c in "-_" for c in user):
+                return "Username may only contain lowercase letters, digits, - and _"
+            if self.e_pw.get_text() != self.e_pw2.get_text():
+                return "Passwords do not match"
+            if not self.e_pw.get_text() and not self.e_sshkey.get_text().strip():
+                return "Set a password or an SSH key, or the account cannot log in"
+        return None
+
+    # --- running the install ----------------------------------------------
+    def _build_plan(self):
+        full, _added = self._resolve_requires(self._selected_module_ids())
+        return {
+            "disk": self.sel_disk,
+            "scheme": self.sel_scheme,
+            "fs": self.sel_fs,
+            "encrypt": self.sel_encrypt,
+            "hostname": self.e_hostname.get_text().strip(),
+            "timezone": self.c_timezone.value(),
+            "locale": self.c_locale.value(),
+            "keymap": self.c_keymap.value(),
+            "username": self.e_user.get_text().strip(),
+            "full_name": self.e_fullname.get_text().strip(),
+            "ssh_key": self.e_sshkey.get_text().strip(),
+            "modules": full,
+            "dry_run": os.environ.get("AXOS_DRY_RUN") == "1",
+        }
+
+    @staticmethod
+    def _is_progress(text):
+        """A redrawn progress bar, e.g. '[=====   ] 45000/114122  39%'."""
+        t = text.lstrip()
+        return t.startswith("[") and "%" in t
+
+    def _append_log(self, text):
+        # unsquashfs redraws its progress bar with a carriage return, which
+        # the backend now surfaces as a stream of separate lines. Appending
+        # every redraw would push thousands of near-identical lines into the
+        # view, so consecutive progress updates overwrite the previous one.
+        progress = self._is_progress(text)
+        if progress and self._last_was_progress:
+            start = self.log_buffer.get_iter_at_line(
+                max(0, self.log_buffer.get_line_count() - 2))
+            self.log_buffer.delete(start, self.log_buffer.get_end_iter())
+        self.log_buffer.insert(self.log_buffer.get_end_iter(), text + "\n")
+        self._last_was_progress = progress
+
+        # Keep the newest line in view without stealing focus.
+        mark = self.log_buffer.create_mark(None, self.log_buffer.get_end_iter(), False)
+        self.log_view.scroll_mark_onscreen(mark)
+        self.log_buffer.delete_mark(mark)
+
+    def _start_install(self):
+        if self.install_started:
+            return
+        self.install_started = True
+        self._show_page(7)
+        self.btn_back.set_visible(False)
+        self.btn_next.set_sensitive(False)
+
+        exe = backend_path()
+        if exe is None:
+            self._install_failed("ax-installer was not found on PATH")
+            return
+
+        plan = self._build_plan()
+        try:
+            fd, plan_path = __import__("tempfile").mkstemp(
+                prefix="axos-plan-", suffix=".json")
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(plan, fh)
+            os.chmod(plan_path, 0o600)
+        except OSError as exc:
+            self._install_failed("could not write the plan file: %s" % exc)
+            return
+        self.plan_path = plan_path
+
+        argv = escalation_prefix() + [exe, "--run-plan", plan_path]
+        self._append_log("$ " + " ".join(argv))
+
+        try:
+            self.proc = Gio.Subprocess.new(
+                argv,
+                Gio.SubprocessFlags.STDIN_PIPE
+                | Gio.SubprocessFlags.STDOUT_PIPE
+                | Gio.SubprocessFlags.STDERR_MERGE,
+            )
+        except GLib.Error as exc:
+            self._install_failed("could not start the installer: %s" % exc.message)
+            return
+
+        # Secrets go over stdin so they never reach argv or the plan file.
+        secrets = json.dumps({
+            "password": self.e_pw.get_text(),
+            "luks_passphrase": self.luks_entry.get_text() if self.sel_encrypt else "",
+        })
+        stdin = self.proc.get_stdin_pipe()
+        try:
+            stdin.write_all(secrets.encode("utf-8"), None)
+            stdin.close(None)
+        except GLib.Error as exc:
+            self._install_failed("could not send credentials: %s" % exc.message)
+            return
+
+        stream = Gio.DataInputStream.new(self.proc.get_stdout_pipe())
+        self._read_next(stream)
+        self.proc.wait_async(None, self._on_proc_done)
+
+    def _read_next(self, stream):
+        stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self._on_line, stream)
+
+    def _on_line(self, stream, result, _user):
+        try:
+            raw, _len = stream.read_line_finish_utf8(result)
+        except GLib.Error:
+            return
+        if raw is None:
+            return
+        line = raw.strip()
+        if line:
+            self._handle_event(line)
+        self._read_next(stream)
+
+    def _handle_event(self, line):
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            # Anything the engine did not emit as JSON is still worth showing.
+            self._append_log(line)
+            return
+
+        kind = ev.get("type")
+        if kind == "progress":
+            total = ev.get("total") or 1
+            step = ev.get("step") or 0
+            self.progress.set_fraction(max(0.0, min(1.0, ev.get("fraction", 0.0))))
+            self.progress.set_text("%d/%d  %s" % (step, total, ev.get("name", "")))
+            self.install_status.set_text(ev.get("name", ""))
+        elif kind == "log":
+            self._append_log(ev.get("line", ""))
+        elif kind == "error":
+            self._install_failed(ev.get("message", "unknown error"))
+        elif kind == "done":
+            self._install_ok()
+
+    def _on_proc_done(self, proc, result):
+        try:
+            proc.wait_finish(result)
+        except GLib.Error:
+            pass
+        self._cleanup_plan()
+        # A non-zero exit without a JSON error event means the backend died
+        # before it could report anything - a missing sudo rule, most often.
+        if not self.install_failed and proc.get_exit_status() != 0 and \
+                self.progress.get_fraction() < 1.0:
+            self._install_failed(
+                "the installer exited unexpectedly (status %d). "
+                "Check that this session can escalate with sudo or pkexec."
+                % proc.get_exit_status())
+
+    def _cleanup_plan(self):
+        path = getattr(self, "plan_path", None)
+        if path and os.path.exists(path):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    def _install_ok(self):
+        self.progress.set_fraction(1.0)
+        self.progress.set_text("complete")
+        self.install_status.set_text("AndersXn OS is installed.")
+        self.install_status.remove_css_class("axos-subtitle")
+        self.install_status.add_css_class("axos-ok")
+        self.btn_next.set_sensitive(True)
+        self.hint.set_text("Remove the installation medium before rebooting.")
+
+    def _install_failed(self, message):
+        self.install_failed = True
+        self._cleanup_plan()
+        self.install_status.set_text("Installation failed")
+        self.install_status.remove_css_class("axos-subtitle")
+        self.install_status.add_css_class("axos-err")
+        self._append_log("ERROR: " + message)
+        self.progress.set_text("failed")
+        self.btn_next.set_label("Quit")
+        self.btn_next.set_sensitive(True)
+        self.btn_next.disconnect_by_func(self.on_next)
+        self.btn_next.connect("clicked", lambda _b: self.get_application().quit())
+
+    def _reboot(self):
+        for argv in (["systemctl", "reboot"], ["reboot"]):
+            exe = shutil.which(argv[0])
+            if exe:
+                subprocess.Popen(escalation_prefix() + [exe] + argv[1:])
+                return
+        self.get_application().quit()
+
+
+class InstallerApp(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="org.andersxn.Installer")
+
+    def do_activate(self):
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS.encode("utf-8"))
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        info, err = probe()
+        win = InstallerWindow(self, info, err)
+        win.present()
+
+
+def main():
+    settings = Gtk.Settings.get_default()
+    if settings is not None:
+        settings.set_property("gtk-application-prefer-dark-theme", True)
+    return InstallerApp().run(sys.argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

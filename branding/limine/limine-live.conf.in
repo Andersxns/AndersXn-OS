@@ -1,0 +1,49 @@
+# AndersXn OS - Limine configuration for LIVE installer media.
+#
+# The live ISO boots a squashfs via live-boot, so there is no root device UUID
+# to resolve; these entries differ from the installed-system template.
+#
+# The live session autologins straight into the dedicated AndersXn installer
+# session (see build/stages/25-desktop.sh). There is no axos.installer= switch
+# any more - that chose between a TUI and a shell on tty1, back when a getty
+# override ran the installer. SDDM owns tty1 now.
+
+timeout: 10
+default_entry: 1
+
+interface_branding: @NAME@ @VERSION@ installer
+interface_branding_colour: 6
+
+term_palette: @INK@;e5484d;63d68a;e8b84b;4fc3f7;1b6ca8;6b7a90;@SNOW@
+term_background: @INK@
+term_foreground: @SNOW@
+
+wallpaper: boot():/andersxn/splash.png
+wallpaper_style: centered
+backdrop: @INK@
+
+/Install @NAME@ @VERSION@
+    comment: Start the AndersXn installer
+    protocol: linux
+    path: boot():/live/vmlinuz
+    cmdline: boot=live components quiet splash loglevel=3
+    module_path: boot():/live/initrd.img
+
+/Install @NAME@ @VERSION@ (safe graphics)
+    comment: Force a basic framebuffer - use if the screen stays blank
+    protocol: linux
+    path: boot():/live/vmlinuz
+    cmdline: boot=live components nomodeset loglevel=7
+    module_path: boot():/live/initrd.img
+
+/Rescue console (no desktop)
+    comment: Boot to a root console on tty2 instead of the installer
+    protocol: linux
+    path: boot():/live/vmlinuz
+    cmdline: boot=live components loglevel=7 systemd.unit=multi-user.target
+    module_path: boot():/live/initrd.img
+
+/+Firmware
+    //UEFI firmware setup
+        protocol: efi
+        image_path: fwsetup://

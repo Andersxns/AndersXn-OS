@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+#
+# AndersXn OS - dynamic login status block.
+#
+# Regenerated into /run/motd.dynamic by axos-motd.service. Kept deliberately
+# cheap: this runs on every SSH login, so nothing here may block on the
+# network or shell out to a container runtime that might be starting up.
+
+set -uo pipefail
+
+c_accent=$'\033[38;2;79;195;247m'
+c_muted=$'\033[38;2;107;122;144m'
+c_warn=$'\033[38;2;232;184;75m'
+c_ok=$'\033[38;2;99;214;138m'
+c_reset=$'\033[0m'
+
+row() { printf '  %s%-10s%s %s\n' "$c_muted" "$1" "$c_reset" "$2"; }
+
+# --- uptime and load --------------------------------------------------------
+read -r uptime_s _ < /proc/uptime
+uptime_s=${uptime_s%.*}
+printf -v uptime_h '%dd %dh %dm' \
+    $(( uptime_s / 86400 )) $(( uptime_s % 86400 / 3600 )) $(( uptime_s % 3600 / 60 ))
+read -r l1 l5 l15 _ < /proc/loadavg
+
+# --- memory -----------------------------------------------------------------
+mem_total=$(awk '/^MemTotal:/     {print $2}' /proc/meminfo)
+mem_avail=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+mem_used_pct=$(( (mem_total - mem_avail) * 100 / mem_total ))
+
+# --- root filesystem --------------------------------------------------------
+read -r _ fs_size fs_used _ fs_pct _ < <(df -h / | tail -1)
+
+printf '\n'
+row "uptime"  "$uptime_h"
+row "load"    "$l1 $l5 $l15"
+row "memory"  "$(( (mem_total - mem_avail) / 1024 ))M / $(( mem_total / 1024 ))M (${mem_used_pct}%)"
+
+if [[ ${fs_pct%\%} -ge 90 ]]; then
+    row "disk /" "${c_warn}${fs_used} / ${fs_size} (${fs_pct})${c_reset}"
+else
+    row "disk /" "${fs_used} / ${fs_size} (${fs_pct})"
+fi
+
+# --- container runtime, only if actually present and running ----------------
+if [[ -S /run/docker.sock ]] && command -v docker >/dev/null 2>&1; then
+    running=$(docker ps --quiet 2>/dev/null | wc -l)
+    total=$(docker ps --quiet --all 2>/dev/null | wc -l)
+    row "docker" "${c_ok}${running}${c_reset} running / ${total} total"
+fi
+
+if systemctl is-active --quiet k3s 2>/dev/null; then
+    row "k3s" "${c_ok}active${c_reset}"
+fi
+
+# --- pending reboot ---------------------------------------------------------
+if [[ -f /run/reboot-required ]]; then
+    printf '\n  %sreboot required to finish applying updates%s\n' "$c_warn" "$c_reset"
+fi
+
+printf '\n'

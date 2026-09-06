@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+#
+# ax-release - print the AndersXn OS build and install manifest for this system.
+# The first thing to ask for in a bug report.
+
+set -euo pipefail
+
+accent=$'\033[38;2;79;195;247m'
+muted=$'\033[38;2;107;122;144m'
+reset=$'\033[0m'
+
+logo=/usr/share/andersxn/ascii/axos-logo-compact.txt
+[[ -r "$logo" ]] && printf '%s' "$accent" && cat "$logo" && printf '%s\n' "$reset"
+
+row() { printf '  %s%-16s%s %s\n' "$muted" "$1" "$reset" "$2"; }
+
+# shellcheck source=/dev/null
+. /etc/os-release
+row "release" "$PRETTY_NAME"
+row "id" "$ID"
+row "arch" "$(uname -m)"
+row "kernel" "$(uname -r)"
+
+for manifest in /etc/andersxn/build-manifest /etc/andersxn/install-manifest; do
+    [[ -r "$manifest" ]] || continue
+    echo
+    printf '  %s%s%s\n' "$muted" "${manifest##*/}" "$reset"
+    while IFS='=' read -r key value; do
+        [[ "$key" =~ ^# ]] || [[ -z "$key" ]] && continue
+        row "${key#AXOS_}" "$value"
+    done < "$manifest"
+done
+
+if [[ -d /etc/andersxn/provision.d ]]; then
+    echo
+    printf '  %sprovisioned%s\n' "$muted" "$reset"
+    found=0
+    for f in /etc/andersxn/provision.d/*.done; do
+        [[ -e "$f" ]] || continue
+        name="$(basename "$f" .done)"
+        row "$name" "$(cat "$f")"
+        found=1
+    done
+    (( found )) || row "-" "nothing"
+fi
+echo

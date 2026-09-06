@@ -1,0 +1,9 @@
+@ASCII_FULL@
+  @NAME@ @VERSION@ (@CODENAME@) - @ARCH@
+
+  docs   @SUPPORT_URL@
+  issues @BUG_URL@
+
+  ax-provision --list    show available homelab modules
+  ax-release             show build manifest for this system
+

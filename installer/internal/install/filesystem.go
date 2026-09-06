@@ -1,0 +1,175 @@
+package install
+
+import (
+	"context"
+	"fmt"
+	"path/filepath"
+	"strings"
+
+	"github.com/ggstudios/andersxn-os/installer/internal/sys"
+)
+
+// stepFilesystems formats the boot partition and the root volume.
+func (e *Engine) stepFilesystems(ctx context.Context) error {
+	p := e.Plan
+	root := p.RootDevice()
+
+	// FAT32 on both firmware paths - see the BootMountPoint comment in plan.go.
+	e.logf("formatting %s as FAT32 (boot)", p.BootPartition())
+	if err := e.R.Run(ctx, "mkfs.vfat", "-F", "32", "-n", "AXOS-BOOT", p.BootPartition()); err != nil {
+		return fmt.Errorf("formatting boot partition: %w", err)
+	}
+
+	e.logf("formatting %s as %s (root)", root, p.FS)
+	switch p.FS {
+	case FSBtrfs:
+		if err := e.R.Run(ctx, "mkfs.btrfs", "-f", "-L", "AXOS", root); err != nil {
+			return fmt.Errorf("formatting root: %w", err)
+		}
+		if err := e.createSubvolumes(ctx); err != nil {
+			return err
+		}
+	case FSExt4:
+		if err := e.R.Run(ctx, "mkfs.ext4", "-F", "-L", "AXOS", root); err != nil {
+			return fmt.Errorf("formatting root: %w", err)
+		}
+	case FSXFS:
+		if err := e.R.Run(ctx, "mkfs.xfs", "-f", "-L", "AXOS", root); err != nil {
+			return fmt.Errorf("formatting root: %w", err)
+		}
+	default:
+		return fmt.Errorf("unsupported filesystem %q", p.FS)
+	}
+
+	var err error
+	if e.rootUUID, err = sys.BlkidValue(ctx, e.R, root, "UUID"); err != nil {
+		return err
+	}
+	if e.bootUUID, err = sys.BlkidValue(ctx, e.R, p.BootPartition(), "UUID"); err != nil {
+		return err
+	}
+	e.logf("   root UUID %s, boot UUID %s", e.rootUUID, e.bootUUID)
+	return nil
+}
+
+// createSubvolumes builds the btrfs layout by mounting the top-level volume,
+// creating each subvolume, then unmounting again. The real mount happens in
+// stepMount against subvol=@.
+func (e *Engine) createSubvolumes(ctx context.Context) error {
+	const staging = "/mnt/axos-subvol"
+
+	if err := e.R.Run(ctx, "mkdir", "-p", staging); err != nil {
+		return err
+	}
+	if err := e.R.Run(ctx, "mount", "-o", "noatime", e.Plan.RootDevice(), staging); err != nil {
+		return fmt.Errorf("mounting btrfs top level: %w", err)
+	}
+	// Unmounted here rather than tracked in e.mounted: this staging mount must
+	// be gone before stepMount remounts the same volume at subvol=@.
+	defer func() { _ = e.R.Run(context.WithoutCancel(ctx), "umount", staging) }()
+
+	for _, sv := range BtrfsSubvolumes {
+		path := filepath.Join(staging, sv.Name)
+		if err := e.R.Run(ctx, "btrfs", "subvolume", "create", path); err != nil {
+			return fmt.Errorf("creating subvolume %s: %w", sv.Name, err)
+		}
+		if sv.NoCOW {
+			// The attribute only takes on an empty directory, which is exactly
+			// what this is right now.
+			if err := e.R.Run(ctx, "chattr", "+C", path); err != nil {
+				e.logf("   note: could not set nodatacow on %s: %v", sv.Name, err)
+			}
+		}
+	}
+	e.logf("   created %d btrfs subvolumes", len(BtrfsSubvolumes))
+	return nil
+}
+
+// stepMount assembles the target tree at e.Root.
+func (e *Engine) stepMount(ctx context.Context) error {
+	p := e.Plan
+
+	if err := e.R.Run(ctx, "mkdir", "-p", e.Root); err != nil {
+		return err
+	}
+
+	if p.FS == FSBtrfs {
+		if err := e.mount(ctx, "-o", p.MountOptions(BtrfsSubvolumes[0]), p.RootDevice(), e.Root); err != nil {
+			return fmt.Errorf("mounting root subvolume: %w", err)
+		}
+		// Sorted by mount path so a nested target (/var/log under /var) is
+		// always mounted after its parent exists.
+		rest := append([]Subvolume(nil), BtrfsSubvolumes[1:]...)
+		sortByPathDepth(rest)
+		for _, sv := range rest {
+			if sv.MountAt == "" {
+				continue
+			}
+			target := filepath.Join(e.Root, sv.MountAt)
+			if err := e.R.Run(ctx, "mkdir", "-p", target); err != nil {
+				return err
+			}
+			if err := e.mount(ctx, "-o", p.MountOptions(sv), p.RootDevice(), target); err != nil {
+				return fmt.Errorf("mounting %s: %w", sv.Name, err)
+			}
+		}
+	} else {
+		if err := e.mount(ctx, "-o", "noatime", p.RootDevice(), e.Root); err != nil {
+			return fmt.Errorf("mounting root: %w", err)
+		}
+	}
+
+	boot := filepath.Join(e.Root, BootMountPoint)
+	if err := e.R.Run(ctx, "mkdir", "-p", boot); err != nil {
+		return err
+	}
+	// umask=0077 keeps /boot unreadable to non-root: it holds the bootloader
+	// config and, on an encrypted install, the initramfs.
+	if err := e.mount(ctx, "-o", "umask=0077", p.BootPartition(), boot); err != nil {
+		return fmt.Errorf("mounting boot partition: %w", err)
+	}
+
+	e.logf("target mounted at %s", e.Root)
+	return nil
+}
+
+// sortByPathDepth orders subvolumes so shallower mount points come first.
+func sortByPathDepth(svs []Subvolume) {
+	for i := 1; i < len(svs); i++ {
+		for j := i; j > 0 && depth(svs[j].MountAt) < depth(svs[j-1].MountAt); j-- {
+			svs[j], svs[j-1] = svs[j-1], svs[j]
+		}
+	}
+}
+
+func depth(path string) int { return strings.Count(strings.TrimSuffix(path, "/"), "/") }
+
+// stepFstab writes /etc/fstab from the layout that was actually mounted.
+func (e *Engine) stepFstab(ctx context.Context) error {
+	p := e.Plan
+
+	var b strings.Builder
+	b.WriteString("# /etc/fstab - generated by AX-Installer\n")
+	b.WriteString("# <device> <mount point> <type> <options> <dump> <pass>\n\n")
+
+	if p.FS == FSBtrfs {
+		for _, sv := range BtrfsSubvolumes {
+			if sv.MountAt == "" {
+				continue
+			}
+			// btrfs does its own consistency checking; fsck pass must be 0.
+			fmt.Fprintf(&b, "UUID=%-36s  %-18s  btrfs  %s  0 0\n",
+				e.rootUUID, sv.MountAt, p.MountOptions(sv))
+		}
+	} else {
+		fmt.Fprintf(&b, "UUID=%-36s  %-18s  %-5s  defaults,noatime  0 1\n",
+			e.rootUUID, "/", p.FS)
+	}
+
+	fmt.Fprintf(&b, "UUID=%-36s  %-18s  vfat   umask=0077,shortname=winnt  0 2\n",
+		e.bootUUID, BootMountPoint)
+
+	b.WriteString("\ntmpfs  /tmp  tmpfs  defaults,noatime,nosuid,nodev,size=2G  0 0\n")
+
+	return e.writeFile(ctx, "/etc/fstab", b.String(), "0644")
+}

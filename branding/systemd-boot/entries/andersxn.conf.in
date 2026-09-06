@@ -1,0 +1,7 @@
+title      @NAME@ @VERSION@
+version    @VERSION@ (@CODENAME@)
+machine-id @MACHINE_ID@
+sort-key   00-andersxn
+linux      @KERNEL@
+initrd     @INITRD@
+options    root=@ROOT_SPEC@ rw rootflags=subvol=@ quiet loglevel=3 splash vt.global_cursor_default=0

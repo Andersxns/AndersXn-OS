@@ -1,0 +1,7 @@
+title      @NAME@ @VERSION@ (recovery shell)
+version    @VERSION@ (@CODENAME@)
+machine-id @MACHINE_ID@
+sort-key   20-andersxn-recovery
+linux      @KERNEL@
+initrd     @INITRD@
+options    root=@ROOT_SPEC@ rw rootflags=subvol=@ single loglevel=7 systemd.unit=rescue.target

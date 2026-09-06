@@ -1,0 +1,7 @@
+title      @NAME@ @VERSION@ (verbose)
+version    @VERSION@ (@CODENAME@)
+machine-id @MACHINE_ID@
+sort-key   10-andersxn-verbose
+linux      @KERNEL@
+initrd     @INITRD@
+options    root=@ROOT_SPEC@ rw rootflags=subvol=@ loglevel=7

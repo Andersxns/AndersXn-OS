@@ -1,0 +1,17 @@
+work/
+dist/
+__pycache__/
+*.pyc
+*.iso
+*.img
+*.img.zst
+*.iso.zst
+*.sha256
+
+# Compressed release artifacts. The bare *.img / *.iso patterns above do NOT
+# match these - gitignore matches the whole filename, so andersxn-os-1.0-arm64
+# .img.xz slips past *.img and lands in the commit. GitHub rejects any blob
+# over 100MB, so this is a failed push rather than a silent mistake, but the
+# repository is better off never seeing a 1.8GB file at all. Release binaries
+# belong in GitHub Releases, not in git history.
+*.xz

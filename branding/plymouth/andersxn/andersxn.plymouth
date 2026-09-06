@@ -1,0 +1,8 @@
+[Plymouth Theme]
+Name=AndersXn
+Description=AndersXn OS boot splash - the alpine mark over deep space
+ModuleName=script
+
+[script]
+ImageDir=/usr/share/plymouth/themes/andersxn
+ScriptFile=/usr/share/plymouth/themes/andersxn/andersxn.script

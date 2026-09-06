@@ -1,0 +1,12 @@
+# AndersXn OS - systemd-boot loader configuration (template).
+#
+# Alternative to Limine, selected with: build.sh --bootloader systemd-boot
+# UEFI only - there is no BIOS fallback. Limine remains the default because a
+# homelab fleet usually contains at least one legacy-BIOS box.
+
+default  andersxn-@VERSION@.conf
+timeout  5
+console-mode keep
+editor   no
+auto-firmware yes
+auto-entries  yes
