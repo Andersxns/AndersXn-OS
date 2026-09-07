@@ -56,6 +56,36 @@ func (e *Engine) stepCopySystem(ctx context.Context) error {
 	if err := e.R.Run(ctx, "rsync", args...); err != nil {
 		return fmt.Errorf("copying system: %w", err)
 	}
+	return e.copyBoot(ctx)
+}
+
+// copyBoot makes a second pass over /boot.
+//
+// The main copy runs rsync with -x (--one-file-system), which stops dead at a
+// mount boundary. That is correct for /dev and friends, but /boot is its own
+// filesystem on every Raspberry Pi image - a FAT32 firmware partition beside
+// the btrfs root - and the kernels live on it. Without this pass the target
+// receives an empty /boot and the install dies later in stepBootloader with
+// "no kernel found in /boot", having already partitioned the disk.
+//
+// When /boot is merely a directory on the root filesystem the main rsync has
+// already copied it and this pass finds everything present and identical, so
+// it runs unconditionally rather than behind a mount-point test.
+//
+// The flags are deliberately not -aHAX: the target /boot is always FAT32
+// (mkfs.vfat in stepFormat), which cannot store ownership, Unix permissions,
+// xattrs or symlinks. -rtL copies recursively, keeps timestamps, and resolves
+// symlinks into real files rather than failing on them.
+func (e *Engine) copyBoot(ctx context.Context) error {
+	if _, err := os.Stat(BootMountPoint); err != nil {
+		return nil // no /boot on the source; nothing to carry over
+	}
+	e.logf("copying %s (a separate filesystem is skipped by the main pass)", BootMountPoint)
+
+	dst := filepath.Join(e.Root, BootMountPoint) + "/"
+	if err := e.R.Run(ctx, "rsync", "-rtL", "--info=progress2", BootMountPoint+"/", dst); err != nil {
+		return fmt.Errorf("copying %s: %w", BootMountPoint, err)
+	}
 	return nil
 }
 

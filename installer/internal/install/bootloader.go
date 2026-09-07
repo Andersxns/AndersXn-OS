@@ -32,7 +32,36 @@ func (e *Engine) stepBootloader(ctx context.Context) error {
 	if err := e.installLimine(ctx, kernel, initrd); err != nil {
 		return err
 	}
-	return nil
+	return e.writePiCmdline(ctx)
+}
+
+// writePiCmdline repoints the Raspberry Pi kernel command line at the new root.
+//
+// A Pi never consults Limine. Its firmware reads config.txt and cmdline.txt
+// straight from the boot partition, and both arrive in the target as verbatim
+// copies of the source system's - so cmdline.txt still carries the root= of
+// the disk the installer was run from. Left alone, the installed system either
+// boots the source medium or, once that is unplugged, waits forever for a root
+// device that is not there.
+//
+// config.txt needs no such treatment: it names kernels by filename, and those
+// files are copied across unchanged.
+//
+// On anything that is not a Pi there is no config.txt and this does nothing.
+func (e *Engine) writePiCmdline(ctx context.Context) error {
+	if _, err := os.Stat(filepath.Join(e.Root, BootMountPoint, "config.txt")); err != nil {
+		return nil
+	}
+	e.logf("Raspberry Pi boot path detected; rewriting cmdline.txt for the new root")
+
+	// One line only. The firmware passes the file verbatim and silently drops
+	// everything after the first newline, so a stray line break costs you every
+	// parameter that follows it.
+	line := fmt.Sprintf(
+		"console=serial0,115200 console=tty1 root=%s rootfstype=%s%s rw fsck.repair=yes rootwait quiet splash",
+		e.rootSpec(), e.Plan.FS, e.rootFlags())
+
+	return e.writeFile(ctx, BootMountPoint+"/cmdline.txt", line+"\n", "0644")
 }
 
 // findKernel locates the newest kernel and matching initramfs in the target's
