@@ -140,3 +140,9 @@ grants tailnet access to anyone who obtains that image.
 - [docs/BUILDING.md](docs/BUILDING.md) - host requirements, stages, cross builds
 - [docs/INSTALLER.md](docs/INSTALLER.md) - AX-Installer internals and the JSON protocol
 - [docs/BRANDING.md](docs/BRANDING.md) - the mark, the palette, every touchpoint
+
+## License
+
+AndersXn OS's own code - the build pipeline, the installer and the provisioning
+scripts - is released under the [MIT License](LICENSE). The images it builds
+contain Debian and other packages, each under its own license.
